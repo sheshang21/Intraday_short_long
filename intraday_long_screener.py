@@ -9,7 +9,7 @@ import streamlit as st
 # ── yf_ratelimit shim ──────────────────────────────────────────
 # Replaces direct yfinance calls with rate-limit-safe wrappers.
 # DO NOT remove this block.
-from yf_ratelimit import safe_ticker as _rl_ticker, safe_download as _rl_download
+from yf_ratelimit import safe_ticker as _rl_ticker, safe_download as _rl_download, clear_cache as _rl_clear_cache
 
 class _YFShim:
     """Makes existing yf.Ticker() / yf.download() calls use safe wrappers."""
@@ -34,12 +34,71 @@ import io
 
 # ── Cached fetch helpers ────────────────────────────────────────
 # Module-level (not class methods) so Streamlit can cache them across
-# reruns/scans. Cuts repeated yfinance calls drastically, which is the
-# main cause of Streamlit Cloud rate-limit / resource burn.
+# reruns/scans, and so the WHOLE scan list can be fetched in a small
+# number of bulk yf.download() calls instead of one call per ticker.
+# This is the single biggest speed lever: 300 tickers used to mean
+# ~600 individual requests; now it's 2-6 bulk requests total.
 
-@st.cache_data(ttl=90, show_spinner=False)
+_BULK_CHUNK_SIZE = 150  # tickers per yf.download() call
+
+def _bulk_download_impl(full_tickers: tuple, period: str, interval: str, chunk_workers: int = 3):
+    """Bulk-fetch OHLCV for MANY tickers via yf.download(), chunked + parallel
+    only at the chunk level (not per-ticker). Uncached — call via
+    _bulk_download() (cached) or directly when you need a guaranteed fresh hit."""
+    chunks = [full_tickers[i:i + _BULK_CHUNK_SIZE] for i in range(0, len(full_tickers), _BULK_CHUNK_SIZE)]
+
+    def _dl(chunk):
+        tickers_str = " ".join(chunk)
+        try:
+            # NOTE: don't pass progress= here — yf_ratelimit.safe_download()
+            # hardcodes progress=False internally; passing it again raises
+            # "got multiple values for keyword argument 'progress'".
+            return yf.download(tickers_str, period=period, interval=interval,
+                                group_by='ticker', threads=True,
+                                auto_adjust=False)
+        except TypeError:
+            # Shim may not accept every kwarg — retry minimal.
+            return yf.download(tickers_str, period=period, interval=interval)
+        except Exception:
+            return pd.DataFrame()
+
+    if len(chunks) == 1:
+        return _dl(chunks[0])
+
+    frames = []
+    with ThreadPoolExecutor(max_workers=max(1, min(chunk_workers, len(chunks)))) as executor:
+        for df in executor.map(_dl, chunks):
+            if df is not None and not df.empty:
+                frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, axis=1)
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def _bulk_download(full_tickers: tuple, period: str, interval: str, chunk_workers: int = 3):
+    """Cached entry point — reuses a result from the last 45s for the same
+    ticker set/timeframe. Skipped entirely by the scan handler when
+    'Force fresh data' is on (it calls _bulk_download_impl directly instead)."""
+    return _bulk_download_impl(full_tickers, period, interval, chunk_workers)
+
+
+def _extract_ticker_df(batch_df: pd.DataFrame, full_ticker: str) -> pd.DataFrame:
+    """Pull one ticker's OHLCV slice out of a bulk-downloaded multi-ticker frame."""
+    if batch_df is None or batch_df.empty:
+        return pd.DataFrame()
+    if isinstance(batch_df.columns, pd.MultiIndex):
+        if full_ticker not in batch_df.columns.get_level_values(0):
+            return pd.DataFrame()
+        return batch_df[full_ticker].dropna(how='all')
+    # A single-ticker bulk call sometimes comes back with flat columns
+    return batch_df.dropna(how='all')
+
+
+@st.cache_data(ttl=45, show_spinner=False)
 def _fetch_core_data(full_ticker: str):
-    """Fetch intraday (1d/1m) + daily (5d/1d) history for one ticker, cached."""
+    """Fallback single-ticker fetch — only hit if a ticker is missing from
+    a bulk batch (rare, e.g. newly listed / delisted symbols)."""
     stock = yf.Ticker(full_ticker)
     intraday = stock.history(period='1d', interval='1m')
     daily = stock.history(period='5d', interval='1d')
@@ -90,13 +149,17 @@ class IntradayLongScreener:
             st.error(f"Error reading {file_path}: {str(e)}")
             return ['RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'ICICIBANK']
 
-    def analyze_stock(self, ticker, exchange='NSE'):
-        """Analyze individual stock for long/buy setup"""
+    def analyze_stock(self, ticker, exchange='NSE', intraday=None, daily=None):
+        """Analyze individual stock for long/buy setup.
+        Pass pre-fetched `intraday`/`daily` (sliced from a bulk download) to
+        avoid an extra network call — that's the fast path used by the scan.
+        """
         try:
             suffix = '.NS' if exchange == 'NSE' else '.BO'
             full_ticker = f"{ticker}{suffix}"
 
-            intraday, daily = _fetch_core_data(full_ticker)
+            if intraday is None or daily is None or intraday.empty or daily.empty:
+                intraday, daily = _fetch_core_data(full_ticker)
 
             if intraday.empty or daily.empty:
                 return None
@@ -413,8 +476,10 @@ def show_intraday_long_screener():
 
         with col2:
             momentum_window = st.number_input("Momentum Window (min)", min_value=10, max_value=120, value=30, step=5, key="long_mw")
-            max_workers = st.number_input("Parallel Workers", min_value=1, max_value=8, value=4, step=1, key="long_workers",
-                                           help="Kept low to avoid yfinance rate-limits / Streamlit Cloud resource exhaustion")
+            max_workers = st.number_input("Bulk Download Chunk Workers", min_value=1, max_value=6, value=3, step=1, key="long_workers",
+                                           help="Tickers are fetched in bulk batches of 150. This controls how many "
+                                                "batches run in parallel when your scan list is large — not per-ticker "
+                                                "threads anymore.")
 
         with col3:
             stop_loss_pct = st.number_input("Stop Loss % below Entry Price", min_value=0.1, max_value=5.0, value=0.5, step=0.1, key="long_sl")
@@ -423,6 +488,13 @@ def show_intraday_long_screener():
         with col4:
             strong_score = st.number_input("Strong Signal Score", min_value=60, max_value=90, value=70, step=5, key="long_ss")
             chart_height = st.number_input("Chart Height (px)", min_value=200, max_value=500, value=250, step=50, key="long_ch")
+
+        force_fresh = st.checkbox(
+            "🔄 Force fresh data this scan (recommended)", value=True, key="long_force_fresh",
+            help="The yf_ratelimit shim caches prices for up to 1 hour in-process. "
+                 "For an intraday screener that's stale data. This clears that cache "
+                 "right before each scan so you always get live prices."
+        )
 
     # Build params dict
     params = {
@@ -459,30 +531,49 @@ def show_intraday_long_screener():
     # ── Scan Button ──────────────────────────────────────────────────
     if st.button(f"🔍 SCAN {scan_count} {exchange} STOCKS FOR BUY SIGNALS", type="primary", use_container_width=True):
         scan_list = stock_list[start_index:end_index + 1]
+        suffix = '.NS' if exchange == 'NSE' else '.BO'
+        full_tickers = tuple(f"{t}{suffix}" for t in scan_list)
 
-        st.info(f"📊 Scanning {len(scan_list)} stocks from index {start_index} to {end_index}...")
-
-        progress_bar = st.progress(0)
+        t0 = time.time()
         status_text = st.empty()
 
+        if force_fresh:
+            _rl_clear_cache()  # bust yf_ratelimit's 1-hour in-process cache
+
+        status_text.text(f"📡 Bulk-downloading {len(full_tickers)} tickers (intraday 1m)...")
+        if force_fresh:
+            intraday_batch = _bulk_download_impl(full_tickers, '1d', '1m', chunk_workers=max_workers)
+        else:
+            intraday_batch = _bulk_download(full_tickers, '1d', '1m', chunk_workers=max_workers)
+
+        status_text.text(f"📡 Bulk-downloading {len(full_tickers)} tickers (daily 5d)...")
+        if force_fresh:
+            daily_batch = _bulk_download_impl(full_tickers, '5d', '1d', chunk_workers=max_workers)
+        else:
+            daily_batch = _bulk_download(full_tickers, '5d', '1d', chunk_workers=max_workers)
+
+        status_text.text("⚙️ Scoring stocks...")
+        progress_bar = st.progress(0)
+
         results = []
+        total = len(scan_list)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_ticker = {executor.submit(screener.analyze_stock, ticker, exchange): ticker for ticker in scan_list}
+        for idx, ticker in enumerate(scan_list):
+            full_ticker = f"{ticker}{suffix}"
+            intraday = _extract_ticker_df(intraday_batch, full_ticker)
+            daily = _extract_ticker_df(daily_batch, full_ticker)
 
-            completed = 0
-            total = len(scan_list)
+            result = screener.analyze_stock(ticker, exchange, intraday=intraday, daily=daily)
+            if result and result['score'] >= screener.min_score:
+                results.append(result)
 
-            for future in as_completed(future_to_ticker):
-                completed += 1
-                progress_bar.progress(completed / total)
-                status_text.text(f"Scanning... {completed}/{total}")
-
-                result = future.result()
-                if result and result['score'] >= screener.min_score:
-                    results.append(result)
+            if idx % 5 == 0 or idx == total - 1:
+                progress_bar.progress((idx + 1) / total)
 
         progress_bar.empty()
+        elapsed = time.time() - t0
+        status_text.text(f"✅ Scanned {total} stocks in {elapsed:.1f}s")
+        time.sleep(0.6)
         status_text.empty()
 
         # Store in session state
