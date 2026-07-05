@@ -39,7 +39,13 @@ import io
 # This is the single biggest speed lever: 300 tickers used to mean
 # ~600 individual requests; now it's 2-6 bulk requests total.
 
-_BULK_CHUNK_SIZE = 150  # tickers per yf.download() call
+_BULK_CHUNK_SIZE = 75   # tickers per yf.download() call
+# Since threads=2 below caps yfinance's INTERNAL concurrency regardless
+# of chunk size, a bigger chunk doesn't create a bigger burst — it just
+# means fewer separate yf.download() calls, i.e. less _throttle()/retry
+# overhead. This is the safe speed lever: raise chunk size, not
+# concurrency. (Was cut to 40 originally alongside threads=True → 2;
+# 75 keeps burst size the same while cutting total round-trips ~2x.)
 
 def _bulk_download_impl(full_tickers: tuple, period: str, interval: str, chunk_workers: int = 3):
     """Bulk-fetch OHLCV for MANY tickers via yf.download(), chunked + parallel
@@ -54,7 +60,7 @@ def _bulk_download_impl(full_tickers: tuple, period: str, interval: str, chunk_w
             # hardcodes progress=False internally; passing it again raises
             # "got multiple values for keyword argument 'progress'".
             return yf.download(tickers_str, period=period, interval=interval,
-                                group_by='ticker', threads=True,
+                                group_by='ticker', threads=2,
                                 auto_adjust=False)
         except TypeError:
             # Shim may not accept every kwarg — retry minimal.
@@ -476,10 +482,12 @@ def show_intraday_long_screener():
 
         with col2:
             momentum_window = st.number_input("Momentum Window (min)", min_value=10, max_value=120, value=30, step=5, key="long_mw")
-            max_workers = st.number_input("Bulk Download Chunk Workers", min_value=1, max_value=6, value=3, step=1, key="long_workers",
-                                           help="Tickers are fetched in bulk batches of 150. This controls how many "
-                                                "batches run in parallel when your scan list is large — not per-ticker "
-                                                "threads anymore.")
+            max_workers = st.number_input("Bulk Download Chunk Workers", min_value=1, max_value=2, value=2, step=1, key="long_workers",
+                                           help="Tickers are fetched in bulk batches of 40. This used to allow up to 6 "
+                                                "parallel batches, which is what was bursting past Yahoo's real rate "
+                                                "limiter and crashing scans. Capped at 2 now — an app-wide request "
+                                                "limiter (yf_ratelimit) enforces the real ceiling regardless of this "
+                                                "setting, so raising it mainly adds retries, not speed.")
 
         with col3:
             stop_loss_pct = st.number_input("Stop Loss % below Entry Price", min_value=0.1, max_value=5.0, value=0.5, step=0.1, key="long_sl")
@@ -490,10 +498,12 @@ def show_intraday_long_screener():
             chart_height = st.number_input("Chart Height (px)", min_value=200, max_value=500, value=250, step=50, key="long_ch")
 
         force_fresh = st.checkbox(
-            "🔄 Force fresh data this scan (recommended)", value=True, key="long_force_fresh",
-            help="The yf_ratelimit shim caches prices for up to 1 hour in-process. "
-                 "For an intraday screener that's stale data. This clears that cache "
-                 "right before each scan so you always get live prices."
+            "🔄 Force fresh data this scan", value=False, key="long_force_fresh",
+            help="Off by default now. Turning this on clears the cache and skips the "
+                 "45s st.cache_data safety net, forcing a brand-new live fetch for every "
+                 "ticker on every scan — on a large scan list this is exactly the pattern "
+                 "that triggers Yahoo's rate limiter. Leave off unless you specifically "
+                 "need up-to-the-second prices for a small watchlist."
         )
 
     # Build params dict
@@ -521,6 +531,25 @@ def show_intraday_long_screener():
 
     if not stock_list:
         st.warning("⚠️ Please select or upload stocks to scan")
+        return
+
+    # ── Hard scan-size cap ────────────────────────────────────────────
+    # Yahoo's real rate limiter (not just our shim) throttles the shared
+    # IPs Streamlit Cloud runs on. Scanning the full NSE list (1500-2000+
+    # tickers) in one click means dozens of retried/backed-off chunks,
+    # which can block for 10-20+ minutes — long enough that Streamlit
+    # Cloud's own health check kills the connection outright. Use the
+    # "Scan Range" controls above to work through a big list in batches
+    # instead of raising this cap.
+    _MAX_SCAN_SIZE = 300
+    if scan_count > _MAX_SCAN_SIZE:
+        st.error(
+            f"⚠️ {scan_count} stocks selected — that's over the {_MAX_SCAN_SIZE}-stock "
+            f"safe limit per scan. Yahoo Finance's rate limiter (not just this app's own "
+            f"throttling) will very likely block or crash a scan this large on Streamlit "
+            f"Cloud's shared IPs. Please narrow the 'Start from index' / 'End at index' "
+            f"range above to {_MAX_SCAN_SIZE} stocks or fewer, then scan in batches."
+        )
         return
 
     # ── Session State Init ───────────────────────────────────────────
@@ -558,14 +587,31 @@ def show_intraday_long_screener():
         results = []
         total = len(scan_list)
 
+        # ── Diagnostics ────────────────────────────────────────────────
+        # "No stocks found" can mean either "genuinely no setups today" or
+        # "the data fetch silently failed for everything" — those look
+        # identical to the user otherwise. Track which bucket each ticker
+        # falls into so we can tell them apart afterward.
+        n_no_data = 0            # intraday/daily came back empty for this ticker
+        n_filtered_out = 0       # had data, but failed price/volume/condition filters
+        n_below_min_score = 0    # passed conditions, but score < Min Score slider
+
         for idx, ticker in enumerate(scan_list):
             full_ticker = f"{ticker}{suffix}"
             intraday = _extract_ticker_df(intraday_batch, full_ticker)
             daily = _extract_ticker_df(daily_batch, full_ticker)
 
+            if intraday.empty or daily.empty:
+                n_no_data += 1
+                continue
+
             result = screener.analyze_stock(ticker, exchange, intraday=intraday, daily=daily)
-            if result and result['score'] >= screener.min_score:
+            if result is None:
+                n_filtered_out += 1
+            elif result['score'] >= screener.min_score:
                 results.append(result)
+            else:
+                n_below_min_score += 1
 
             if idx % 5 == 0 or idx == total - 1:
                 progress_bar.progress((idx + 1) / total)
@@ -578,6 +624,10 @@ def show_intraday_long_screener():
 
         # Store in session state
         st.session_state.long_scan_results = results
+        st.session_state.long_scan_diagnostics = {
+            'total': total, 'no_data': n_no_data,
+            'filtered_out': n_filtered_out, 'below_min_score': n_below_min_score,
+        }
         st.session_state.long_scan_params = params
         st.session_state.long_stop_loss_pct = stop_loss_pct
         st.session_state.long_target_pct = target_pct
@@ -589,6 +639,30 @@ def show_intraday_long_screener():
 
         if not results:
             st.warning("⚠️ No stocks found matching criteria")
+            diag = st.session_state.get('long_scan_diagnostics')
+            if diag:
+                total = diag['total']
+                if total and diag['no_data'] == total:
+                    st.error(
+                        f"🚨 All {total} tickers came back with no price data at all. "
+                        f"This is a **data-fetch failure**, not \"no setups today\" — "
+                        f"most likely Yahoo rate-limited the bulk download, or "
+                        f"'Force fresh data' is off and the cache is stale/empty. "
+                        f"Check the Streamlit Cloud logs for `yf_ratelimit` warnings, "
+                        f"try a smaller scan (20-30 tickers), or try again in a minute."
+                    )
+                elif total and diag['no_data'] > total * 0.5:
+                    st.warning(
+                        f"⚠️ {diag['no_data']} of {total} tickers had no price data "
+                        f"(likely rate-limited or delisted) — results may be incomplete. "
+                        f"Only {total - diag['no_data']} were actually analyzed."
+                    )
+                st.caption(
+                    f"Diagnostics: {diag['no_data']} no data · "
+                    f"{diag['filtered_out']} had data but didn't meet the buy conditions · "
+                    f"{diag['below_min_score']} met conditions but scored below your "
+                    f"Min Score ({screener.min_score}) — try lowering it if this number is high."
+                )
         else:
             results.sort(key=lambda x: x['score'], reverse=True)
 
